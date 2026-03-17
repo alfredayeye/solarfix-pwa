@@ -1,26 +1,17 @@
 /**
- * useSensors — React hook that aggregates:
- *   • Camera stream (rear camera)
- *   • DeviceOrientation (compass heading + tilt → azimuth + elevation)
- *   • Accurate UTC clock
- *
- * Handles iOS permission request for DeviceOrientationEvent.
+ * useSensors — compass, tilt, and UTC clock.
+ * Camera is handled separately in App.tsx so getUserMedia can be called
+ * directly inside a button click handler (required by iOS).
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 
 export interface SensorData {
-  /** Compass heading 0–360° (0 = North) */
-  azimuth: number | null;
-  /** Elevation angle above horizon (degrees) */
-  elevation: number | null;
-  /** Current UTC Date */
-  utcTime: Date;
-  /** Whether sensors are live */
+  azimuth:   number | null;   // compass heading 0–360° (0 = North)
+  elevation: number | null;   // degrees above horizon
+  utcTime:   Date;
   orientationActive: boolean;
 }
-
-export type PermissionState = "idle" | "pending" | "granted" | "denied";
 
 export function useSensors() {
   const [sensors, setSensors] = useState<SensorData>({
@@ -29,94 +20,53 @@ export function useSensors() {
     utcTime: new Date(),
     orientationActive: false,
   });
-  const [cameraPermission, setCameraPermission] = useState<PermissionState>("idle");
-  const [orientationPermission, setOrientationPermission] = useState<PermissionState>("idle");
-  const streamRef = useRef<MediaStream | null>(null);
-  const clockRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── UTC clock ──────────────────────────────────────────────
+  // UTC clock — tick every second
   useEffect(() => {
-    clockRef.current = setInterval(() => {
-      setSensors(s => ({ ...s, utcTime: new Date() }));
-    }, 1000);
-    return () => { if (clockRef.current) clearInterval(clockRef.current); };
+    const id = setInterval(() => setSensors(s => ({ ...s, utcTime: new Date() })), 1000);
+    return () => clearInterval(id);
   }, []);
 
-  // ── Device orientation ─────────────────────────────────────
   const handleOrientation = useCallback((e: DeviceOrientationEvent) => {
-    // iOS uses webkitCompassHeading; Android uses alpha (needs 360-alpha for true heading)
-    const heading =
-      (e as DeviceOrientationEvent & { webkitCompassHeading?: number }).webkitCompassHeading
-      ?? (e.alpha !== null ? (360 - e.alpha) % 360 : null);
+    const ios = e as DeviceOrientationEvent & { webkitCompassHeading?: number };
 
-    // beta: 0 = phone vertical, 90 = phone flat (face up)
-    // When tilting phone back to point at sky: beta goes negative
-    // elevation ≈ -(beta) when phone held in portrait and tilted backward
+    // iOS provides webkitCompassHeading (0–360, true north).
+    // Android alpha is degrees rotated from initial position; (360 - alpha) % 360 gives heading.
+    const azimuth =
+      ios.webkitCompassHeading !== undefined && ios.webkitCompassHeading !== null
+        ? Math.round(ios.webkitCompassHeading * 10) / 10
+        : e.alpha !== null
+        ? Math.round(((360 - e.alpha) % 360) * 10) / 10
+        : null;
+
+    // beta: 0 = phone upright, negative = tilted back (pointing at sky)
+    // elevation above horizon ≈ -beta when phone in portrait, rear cam facing sky
     const elevation = e.beta !== null ? Math.round(-e.beta * 10) / 10 : null;
-    const azimuth   = heading !== null ? Math.round(heading * 10) / 10 : null;
 
     setSensors(s => ({ ...s, azimuth, elevation, orientationActive: true }));
   }, []);
 
   const requestOrientation = useCallback(async () => {
-    setOrientationPermission("pending");
     try {
-      // iOS 13+ requires explicit permission
-      const DOE = DeviceOrientationEvent as unknown as {
-        requestPermission?: () => Promise<string>;
-      };
+      const DOE = DeviceOrientationEvent as unknown as { requestPermission?: () => Promise<string> };
       if (typeof DOE.requestPermission === "function") {
         const result = await DOE.requestPermission();
-        if (result !== "granted") {
-          setOrientationPermission("denied");
-          return;
-        }
+        if (result !== "granted") return;
       }
+      // Use absolute orientation when available (more accurate compass on Android)
       window.addEventListener("deviceorientationabsolute", handleOrientation as EventListener, true);
-      window.addEventListener("deviceorientation", handleOrientation as EventListener, true);
-      setOrientationPermission("granted");
+      window.addEventListener("deviceorientation",         handleOrientation as EventListener, true);
     } catch {
-      setOrientationPermission("denied");
+      // Orientation unavailable — app still works, just without compass
     }
   }, [handleOrientation]);
 
-  // ── Camera ─────────────────────────────────────────────────
-  const startCamera = useCallback(async (videoEl: HTMLVideoElement) => {
-    setCameraPermission("pending");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 } },
-        audio: false,
-      });
-      streamRef.current = stream;
-      videoEl.srcObject = stream;
-      await videoEl.play();
-      setCameraPermission("granted");
-    } catch {
-      setCameraPermission("denied");
-    }
-  }, []);
-
-  const stopCamera = useCallback(() => {
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    streamRef.current = null;
-  }, []);
-
-  // ── Cleanup ────────────────────────────────────────────────
   useEffect(() => {
     return () => {
-      stopCamera();
       window.removeEventListener("deviceorientationabsolute", handleOrientation as EventListener);
-      window.removeEventListener("deviceorientation", handleOrientation as EventListener);
+      window.removeEventListener("deviceorientation",         handleOrientation as EventListener);
     };
-  }, [stopCamera, handleOrientation]);
+  }, [handleOrientation]);
 
-  return {
-    sensors,
-    cameraPermission,
-    orientationPermission,
-    startCamera,
-    stopCamera,
-    requestOrientation,
-  };
+  return { sensors, requestOrientation };
 }
